@@ -2,32 +2,47 @@
 """
 MeshCore EthernetBridge relay service.
 
-Acts as a UDP relay server so two or more mesh nodes with EthernetBridge
-(in unicast mode) can bridge across the internet. Optionally publishes all
-traffic to MQTT for monitoring/debugging via existing analyzers.
+Two operating modes:
+
+─── UDP RELAY MODE (default) ────────────────────────────────────────────────
+Acts as a UDP relay server so mesh nodes with EthernetBridge (unicast mode)
+can bridge across the internet. Requires a server with a stable public IP.
 
 Usage:
     python3 bridge_relay.py [--port 5005] [--bind 0.0.0.0]
                             [--peer IP:PORT ...]
-                            [--peer-timeout 300]
-                            [--keepalive-interval 30]
+                            [--peer-timeout 300] [--keepalive-interval 30]
                             [--mqtt-host HOST] [--mqtt-port 1883]
                             [--mqtt-topic meshcore/bridge]
                             [--mqtt-user USER] [--mqtt-pass PASS]
                             [--channel NAME:SECRET_HEX ...]
                             [--hex] [--quiet]
 
-NAT traversal:
-    Both mesh nodes may be behind NAT. The relay naturally records each
-    node's external (NAT-translated) address on first packet receipt.
-    A periodic keepalive frame is sent to each peer so the NAT mapping
-    stays alive even during quiet periods.
+─── MQTT TRANSPORT MODE (--mqtt-transport) ──────────────────────────────────
+Bridges local LAN EthernetBridge broadcasts to/from a shared MQTT broker.
+No server with a stable public IP required — both sites can be behind NAT
+with rotating IPs since all connections are outbound TCP to the broker.
 
-MQTT topics (when --mqtt-host is set):
-    {prefix}/raw      JSON with hex-encoded raw bridge frame + metadata
-    {prefix}/decoded  JSON with decoded packet fields
+Run one instance per site, each with the same --network-id but a unique
+--site-id. EthernetBridge stays in default broadcast mode; no firmware
+IP configuration changes needed.
 
-    Compatible with the meshcoretomqtt ecosystem / analyzer.letsmesh.net.
+Usage:
+    python3 bridge_relay.py --mqtt-transport
+                            --mqtt-host BROKER_HOSTNAME
+                            [--mqtt-port 8883] [--mqtt-tls]
+                            [--mqtt-user USER] [--mqtt-pass PASS]
+                            [--network-id mynetwork]
+                            [--site-id siteA]
+                            [--port 5005] [--mqtt-topic meshcore/bridge]
+                            [--channel NAME:SECRET_HEX ...]
+                            [--hex] [--quiet]
+
+MQTT transport topics:
+    {prefix}/{network-id}/{site-id}/frames   TX: frames from this site
+    {prefix}/{network-id}/+/frames           RX: frames from all sites
+    {prefix}/{network-id}/raw                monitoring (meshcoretomqtt compat)
+    {prefix}/{network-id}/decoded            monitoring (JSON decoded)
 
 Wire format (EthernetBridge UDP datagram):
     [2]  Magic      0xC03E
@@ -322,16 +337,54 @@ class PeerRegistry:
         return len(self._peers)
 
 
+# ── Loopback dedup (MQTT transport mode) ─────────────────────────────────────
+
+class RecentFrameSet:
+    """
+    TTL-based set of frame content hashes used to suppress loopback echoes.
+
+    When the relay UDP-broadcasts a frame it received from MQTT, the local
+    socket may receive that broadcast back.  Hashing and ignoring recently
+    sent frames prevents this from being relayed back to MQTT.
+    """
+
+    def __init__(self, ttl: float = 60.0):
+        self._entries: dict = {}   # hash_bytes → monotonic timestamp
+        self._ttl = ttl
+
+    @staticmethod
+    def _hash(data: bytes) -> bytes:
+        return hashlib.sha1(data).digest()[:8]
+
+    def add(self, data: bytes):
+        self._entries[self._hash(data)] = time.monotonic()
+
+    def contains(self, data: bytes) -> bool:
+        return self._hash(data) in self._entries
+
+    def expire(self):
+        now   = time.monotonic()
+        stale = [h for h, ts in self._entries.items() if now - ts > self._ttl]
+        for h in stale:
+            del self._entries[h]
+
+
 # ── MQTT helpers ──────────────────────────────────────────────────────────────
 
-def make_mqtt_client(host: str, port: int, user: str | None, password: str | None) -> "mqtt.Client | None":
+def make_mqtt_client(host: str, port: int, user: str | None, password: str | None,
+                     tls: bool = False,
+                     on_message_cb=None) -> "mqtt.Client | None":
     if not MQTT_AVAILABLE:
         print(f"{RED}paho-mqtt is not installed. Install with: pip install paho-mqtt{RESET}",
               file=sys.stderr)
         return None
     client = mqtt.Client()
+    if tls:
+        client.tls_set()   # uses system CA bundle
     if user:
         client.username_pw_set(user, password or "")
+    if on_message_cb is not None:
+        client.on_message = on_message_cb
     try:
         client.connect(host, port, keepalive=60)
         client.loop_start()
@@ -342,16 +395,24 @@ def make_mqtt_client(host: str, port: int, user: str | None, password: str | Non
 
 
 def mqtt_publish_packet(client, prefix: str, src_addr: tuple,
-                        raw_data: bytes, decoded: dict | None):
+                        raw_data: bytes, decoded: dict | None,
+                        monitoring_prefix: str | None = None):
+    """
+    Publish raw + decoded monitoring packets.
+
+    monitoring_prefix overrides the topic root for the raw/decoded topics
+    (used in MQTT transport mode where topics are network-scoped).
+    """
     if client is None:
         return
+    mon = monitoring_prefix if monitoring_prefix is not None else prefix
     ts = time.time()
     base = {"src_ip": src_addr[0], "src_port": src_addr[1], "ts": ts}
 
     # Raw frame
     raw_payload = {**base, "frame_hex": raw_data.hex(), "frame_len": len(raw_data)}
     try:
-        client.publish(f"{prefix}/raw", json.dumps(raw_payload), qos=0)
+        client.publish(f"{mon}/raw", json.dumps(raw_payload), qos=0)
     except Exception:
         pass
 
@@ -359,7 +420,7 @@ def mqtt_publish_packet(client, prefix: str, src_addr: tuple,
     if decoded is not None:
         dec_payload = {**base, **decoded}
         try:
-            client.publish(f"{prefix}/decoded", json.dumps(dec_payload), qos=0)
+            client.publish(f"{mon}/decoded", json.dumps(dec_payload), qos=0)
         except Exception:
             pass
 
@@ -413,6 +474,162 @@ def log_keepalive(addr: tuple):
     print(f"  {DIM}→ keepalive sent to {addr[0]}:{addr[1]}{RESET}")
 
 
+def log_mqtt_rx(site_id: str, decoded: dict | None, raw_payload: bytes, show_hex: bool):
+    now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"\n{BOLD}{CYAN}[{now}]{RESET} {DIM}← mqtt:{RESET} {BOLD}{site_id}{RESET}")
+    if decoded:
+        ptype = decoded.get("payload_type", "?")
+        rtype = decoded.get("route_type",   "?")
+        print(f"  {BOLD}Type:{RESET}  {YELLOW}{ptype}{RESET}  {DIM}({rtype}){RESET}")
+        if decoded.get("path"):
+            print(f"  {BOLD}Path:{RESET}  [{' → '.join(decoded['path'])}]")
+        if "name" in decoded:
+            print(f"  {BOLD}Node:{RESET}  {GREEN}{decoded['name']}{RESET}"
+                  f"  {DIM}[{decoded.get('node_type','')}]{RESET}")
+    if show_hex:
+        print(f"  {DIM}--- raw ({len(raw_payload)} bytes) ---{RESET}")
+        print(hexdump(raw_payload))
+
+
+# ── MQTT transport mode ───────────────────────────────────────────────────────
+
+def run_mqtt_transport(args, sock: socket.socket):
+    """
+    MQTT transport mode: bridge local LAN UDP broadcasts to/from an MQTT
+    broker.  Both sites can be behind NAT with rotating IPs.
+
+    EthernetBridge must stay in its default broadcast mode
+    (ETHERNET_BRIDGE_DEST_IP = 255.255.255.255).  No firmware changes needed.
+    """
+    if not MQTT_AVAILABLE:
+        print(f"{RED}paho-mqtt is required for --mqtt-transport. "
+              f"Install with: pip install paho-mqtt{RESET}", file=sys.stderr)
+        sys.exit(1)
+    if not args.mqtt_host:
+        print(f"{RED}--mqtt-host is required with --mqtt-transport{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    import socket as _socket_mod
+    site_id    = args.site_id or _socket_mod.gethostname()
+    network_id = args.network_id
+
+    own_tx_topic  = f"{args.mqtt_topic}/{network_id}/{site_id}/frames"
+    sub_topic     = f"{args.mqtt_topic}/{network_id}/+/frames"
+    monitor_pfx   = f"{args.mqtt_topic}/{network_id}"
+
+    # Broadcast destination for injecting frames into the local LAN
+    bcast_addr = ("255.255.255.255", args.port)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    dedup    = RecentFrameSet(ttl=60.0)
+    stats    = {"udp_rx": 0, "mqtt_rx": 0, "bad": 0}
+    last_hk  = time.monotonic()
+
+    channels, _ = parse_channels(args.channel)
+
+    def on_message(client, userdata, msg):
+        """Called from paho's background thread when a frame arrives from MQTT."""
+        if msg.topic == own_tx_topic:
+            return   # echo of own publish — ignore
+
+        data = msg.payload
+        raw_mesh = parse_frame(data)
+        if raw_mesh is None or len(raw_mesh) == 0:
+            return
+
+        if dedup.contains(data):
+            return   # already seen (loopback)
+
+        dedup.add(data)
+        stats["mqtt_rx"] += 1
+
+        # Extract sender site-id from topic for logging
+        parts     = msg.topic.split("/")
+        from_site = parts[-2] if len(parts) >= 2 else "?"
+
+        try:
+            sock.sendto(data, bcast_addr)
+        except OSError as exc:
+            if not args.quiet:
+                print(f"  {YELLOW}UDP broadcast failed: {exc}{RESET}")
+            return
+
+        if not args.quiet:
+            decoded = decode_packet(raw_mesh)
+            log_mqtt_rx(from_site, decoded, raw_mesh, args.hex)
+
+    mqtt_client = make_mqtt_client(
+        args.mqtt_host, args.mqtt_port,
+        args.mqtt_user, args.mqtt_pass,
+        tls=args.mqtt_tls,
+        on_message_cb=on_message,
+    )
+    if mqtt_client is None:
+        sys.exit(1)
+
+    mqtt_client.subscribe(sub_topic, qos=0)
+
+    print(f"{BOLD}MeshCore bridge relay{RESET}  [{YELLOW}MQTT transport mode{RESET}]")
+    print(f"  {BOLD}Site:{RESET}      {site_id}")
+    print(f"  {BOLD}Network:{RESET}   {network_id}")
+    print(f"  {BOLD}Broker:{RESET}    {args.mqtt_host}:{args.mqtt_port}"
+          f"{'  (TLS)' if args.mqtt_tls else ''}")
+    print(f"  {BOLD}TX topic:{RESET}  {own_tx_topic}")
+    print(f"  {BOLD}RX topic:{RESET}  {sub_topic}")
+    print(f"  {BOLD}UDP:{RESET}       listening on port {args.port}, "
+          f"broadcasting to {bcast_addr[0]}")
+    print()
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            # Housekeeping: expire old dedup entries
+            if now - last_hk >= 10.0:
+                dedup.expire()
+                last_hk = now
+
+            # Receive from local EthernetBridge
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+
+            stats["udp_rx"] += 1
+
+            raw_mesh = parse_frame(data)
+            if raw_mesh is None or len(raw_mesh) == 0:
+                stats["bad"] += 1
+                continue
+
+            if dedup.contains(data):
+                continue   # own broadcast echo
+
+            dedup.add(data)
+
+            # Publish to MQTT transport topic (relays to remote sites)
+            try:
+                mqtt_client.publish(own_tx_topic, data, qos=0)
+            except Exception as exc:
+                if not args.quiet:
+                    print(f"  {YELLOW}MQTT publish failed: {exc}{RESET}")
+
+            # Decode and publish to monitoring topics
+            decoded = decode_packet(raw_mesh)
+            mqtt_publish_packet(mqtt_client, args.mqtt_topic, addr, data, decoded,
+                                monitoring_prefix=monitor_pfx)
+
+            if not args.quiet:
+                log_packet(addr, [], decoded, raw_mesh, args.hex, mqtt_ok=True)
+
+    except KeyboardInterrupt:
+        print(f"\n{DIM}Stats: udp_rx={stats['udp_rx']} mqtt_rx={stats['mqtt_rx']} "
+              f"bad={stats['bad']}{RESET}")
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        sys.exit(0)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_peer_arg(s: str) -> tuple:
@@ -426,27 +643,38 @@ def parse_peer_arg(s: str) -> tuple:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="MeshCore EthernetBridge relay with optional MQTT monitoring",
+        description="MeshCore EthernetBridge relay / MQTT transport proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # ── Common ────────────────────────────────────────────────────────────────
     p.add_argument("--port",  type=int, default=5005,   help="UDP listen port (default: 5005)")
     p.add_argument("--bind",  default="0.0.0.0",        help="Bind address (default: 0.0.0.0)")
-    p.add_argument("--peer",  type=parse_peer_arg, action="append", metavar="IP:PORT",
-                   help="Static peer address (may be repeated)")
-    p.add_argument("--peer-timeout", type=float, default=300.0,
-                   help="Seconds before a dynamic peer expires (default: 300)")
-    p.add_argument("--keepalive-interval", type=float, default=30.0,
-                   help="Seconds between keepalive pings to each peer (default: 30)")
-    p.add_argument("--mqtt-host",  default=None,  help="MQTT broker hostname (enables MQTT)")
+    p.add_argument("--mqtt-host",  default=None,  help="MQTT broker hostname")
     p.add_argument("--mqtt-port",  type=int, default=1883, help="MQTT broker port (default: 1883)")
     p.add_argument("--mqtt-topic", default="meshcore/bridge", help="MQTT topic prefix")
     p.add_argument("--mqtt-user",  default=None, help="MQTT username")
     p.add_argument("--mqtt-pass",  default=None, help="MQTT password")
+    p.add_argument("--mqtt-tls",   action="store_true",
+                   help="Enable TLS for MQTT (required by most cloud brokers)")
     p.add_argument("--channel", action="append", metavar="NAME:SECRET_HEX",
                    help="Channel secret for decryption (repeat for multiple)")
     p.add_argument("--hex",   action="store_true", help="Show hex dump in console output")
     p.add_argument("--quiet", action="store_true", help="Suppress per-packet console output")
+    # ── MQTT transport mode ───────────────────────────────────────────────────
+    p.add_argument("--mqtt-transport", action="store_true",
+                   help="Use MQTT as internet backbone (no public IP needed)")
+    p.add_argument("--site-id",    default=None,
+                   help="Unique name for this site (default: hostname)")
+    p.add_argument("--network-id", default="default",
+                   help="Shared network namespace on the broker (default: 'default')")
+    # ── UDP relay mode ────────────────────────────────────────────────────────
+    p.add_argument("--peer",  type=parse_peer_arg, action="append", metavar="IP:PORT",
+                   help="Static peer address for relay mode (may be repeated)")
+    p.add_argument("--peer-timeout", type=float, default=300.0,
+                   help="Relay mode: seconds before a dynamic peer expires (default: 300)")
+    p.add_argument("--keepalive-interval", type=float, default=30.0,
+                   help="Relay mode: seconds between keepalive pings (default: 30)")
     return p.parse_args()
 
 
@@ -458,23 +686,32 @@ def main():
     channels, _ = parse_channels(args.channel)
     if channels and not AES_AVAILABLE:
         print(f"{YELLOW}Warning: pycryptodome not installed — channel decryption disabled.{RESET}")
-        channels = {}
 
-    # Build peer registry
-    static_peers = args.peer or []
-    peers = PeerRegistry(static_peers, args.peer_timeout)
-
-    # Set up UDP socket
+    # Set up UDP socket (shared by both modes)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.bind, args.port))
-    sock.settimeout(1.0)  # non-blocking for housekeeping
+    sock.settimeout(1.0)
 
-    # Set up MQTT (optional)
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+    if args.mqtt_transport:
+        if args.peer or args.peer_timeout != 300.0 or args.keepalive_interval != 30.0:
+            print(f"{YELLOW}Note: --peer / --peer-timeout / --keepalive-interval "
+                  f"are ignored in --mqtt-transport mode.{RESET}")
+        run_mqtt_transport(args, sock)
+        return  # run_mqtt_transport exits via sys.exit on KeyboardInterrupt
+
+    # ── UDP relay mode ────────────────────────────────────────────────────────
+
+    static_peers = args.peer or []
+    peers = PeerRegistry(static_peers, args.peer_timeout)
+
+    # Set up MQTT monitoring (optional)
     mqtt_client = None
     if args.mqtt_host:
         mqtt_client = make_mqtt_client(args.mqtt_host, args.mqtt_port,
-                                       args.mqtt_user, args.mqtt_pass)
+                                       args.mqtt_user, args.mqtt_pass,
+                                       tls=args.mqtt_tls)
         if mqtt_client:
             print(f"{BOLD}MQTT:{RESET} connected to {args.mqtt_host}:{args.mqtt_port}"
                   f"  topic prefix={args.mqtt_topic}")
@@ -524,7 +761,6 @@ def main():
 
             raw_mesh = parse_frame(data)
             if raw_mesh is None:
-                # Could be a keepalive echo or garbage; ignore silently
                 stats["bad"] += 1
                 continue
 
@@ -553,13 +789,11 @@ def main():
             # Decode for logging / MQTT
             decoded = decode_packet(raw_mesh)
 
-            # MQTT publish
             mqtt_ok = False
             if mqtt_client is not None:
                 mqtt_publish_packet(mqtt_client, args.mqtt_topic, addr, data, decoded)
                 mqtt_ok = True
 
-            # Console output
             if not args.quiet:
                 log_packet(addr, relayed_to, decoded, raw_mesh, args.hex, mqtt_ok)
 
