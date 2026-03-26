@@ -86,6 +86,7 @@ private:
   EthernetUDP _udp;
   IPAddress _dest_ip;
   uint8_t _rx_buffer[MAX_UDP_PACKET_SIZE];
+  uint32_t _last_init_attempt = 0;  // millis() timestamp of last _udp.begin() attempt
 };
 
 #endif  // WITH_ETHERNET_BRIDGE

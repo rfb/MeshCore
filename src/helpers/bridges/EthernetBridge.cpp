@@ -26,7 +26,17 @@ void EthernetBridge::end() {
 }
 
 void EthernetBridge::loop() {
-  if (!_initialized) return;
+  if (!_initialized) {
+    // begin() may have been called before DHCP completed (e.g. when the Ethernet
+    // init runs in a background task).  Retry once the interface has an IP.
+    uint32_t now = millis();
+    if ((now - _last_init_attempt) >= 5000 &&
+        Ethernet.localIP() != IPAddress(0, 0, 0, 0)) {
+      _last_init_attempt = now;
+      begin();
+    }
+    return;
+  }
 
   int pkt_size = _udp.parsePacket();
   if (pkt_size <= 0) return;
