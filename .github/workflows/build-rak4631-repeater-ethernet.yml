@@ -1,0 +1,36 @@
+name: Build RAK4631 Repeater Ethernet
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Compute Version
+        run: |
+          RAW=$(git describe --tags --always --match 'repeater-*')
+          VERSION="${RAW#repeater-}"
+          echo "FIRMWARE_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Build Firmware
+        env:
+          FIRMWARE_VERSION: ${{ env.FIRMWARE_VERSION }}
+        run: /usr/bin/env bash build.sh build-firmware RAK_4631_repeater_ethernet
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RAK_4631_repeater_ethernet-${{ env.FIRMWARE_VERSION }}
+          path: out
