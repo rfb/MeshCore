@@ -77,6 +77,183 @@ The repeater and room server firmwares can be setup via USB in the web config to
 
 They can also be managed via LoRa in the mobile app by using the Remote Management feature.
 
+## 🌉 EthernetBridge & MQTT Transport
+
+This branch adds native Ethernet bridge support for the RAK4631 repeater, a Python toolchain for relaying and monitoring bridge traffic, and MQTT transport mode so two sites can bridge mesh traffic across the internet without either end needing a public IP.
+
+Key additions:
+- **`EthernetBridge`** — firmware-side UDP bridge for RAK4631 (broadcast or unicast mode)
+- **`bridge_relay.py`** — UDP relay server (requires a public IP) and MQTT transport mode (no public IP needed)
+- **`bridge_monitor.py`** — live packet decoder for local bridge traffic
+- **`bridge_inject.py`** — inject test messages via UDP or MQTT for debugging
+
+### Prerequisites
+
+```bash
+pip install paho-mqtt pycryptodome
+```
+
+### Firmware: Building an Ethernet Repeater
+
+Flash the `RAK_4631_repeater_ethernet` PlatformIO environment onto a RAK4631 + W5100S Ethernet module. The bridge runs in UDP broadcast mode by default (dest `255.255.255.255:5005`), so no IP configuration is needed on the device.
+
+```bash
+pio run -e RAK_4631_repeater_ethernet --target upload
+```
+
+A pre-built firmware artifact is produced on every push to this branch by the **Build RAK4631 Repeater Ethernet** GitHub Actions workflow. Download it from https://github.com/rfb/MeshCore/actions — select the most recent successful run and download the `RAK_4631_repeater_ethernet-*` artifact from the bottom of the run page.
+
+Once flashed, enable the bridge via the config tool at https://config.meshcore.dev or over LoRa using the Remote Management feature in the mobile app.
+
+---
+
+### Connecting Two Sites via a Public MQTT Broker
+
+Run one `bridge_relay.py` instance per site. Both instances connect **outbound** to the broker so neither site needs a public IP or open firewall ports.
+
+**Site A** (e.g. home lab):
+
+```bash
+python3 tools/bridge_relay.py \
+  --mqtt-transport \
+  --mqtt-host broker.hivemq.com \
+  --network-id mynetwork \
+  --site-id siteA
+```
+
+**Site B** (e.g. remote location):
+
+```bash
+python3 tools/bridge_relay.py \
+  --mqtt-transport \
+  --mqtt-host broker.hivemq.com \
+  --network-id mynetwork \
+  --site-id siteB
+```
+
+Each instance listens on UDP port 5005 for local EthernetBridge broadcasts and forwards them to the other site via the broker. The MQTT topics used are:
+
+| Topic | Purpose |
+|---|---|
+| `meshcore/bridge/mynetwork/siteA/frames` | TX frames from Site A |
+| `meshcore/bridge/mynetwork/+/frames` | RX frames from all sites |
+| `meshcore/bridge/mynetwork/raw` | Raw frame monitoring (JSON) |
+| `meshcore/bridge/mynetwork/decoded` | Decoded packet monitoring (JSON) |
+
+**With TLS** (recommended for anything beyond local testing):
+
+```bash
+python3 tools/bridge_relay.py \
+  --mqtt-transport \
+  --mqtt-host your-broker.example.com \
+  --mqtt-port 8883 --mqtt-tls \
+  --mqtt-user myuser --mqtt-pass mypass \
+  --network-id mynetwork \
+  --site-id siteA
+```
+
+---
+
+### Monitoring Local Bridge Traffic
+
+`bridge_monitor.py` listens on the local UDP port and decodes every packet the EthernetBridge sends. Run it on the same machine as the repeater (or any machine on the same LAN):
+
+```bash
+# Basic — shows packet types, paths, and node names
+python3 tools/bridge_monitor.py
+
+# Decrypt group channel messages (hex secret = 32 bytes = 64 hex chars)
+# The default MeshCore public channel:
+python3 tools/bridge_monitor.py \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72"
+
+# Multiple channels + hex dump of raw payloads
+python3 tools/bridge_monitor.py \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --channel "Ops:aabbccdd..." \
+  --hex
+```
+
+Example output:
+
+```
+[14:32:01.412] 192.168.1.42
+  Type:  ADVERT  (FLOOD, ver=0)
+  Node:  MyRepeater  [repeater]
+  ID:    a1b2c3d4...
+
+[14:32:05.881] 192.168.1.42
+  Type:    GRP_TXT  (FLOOD, ver=0)
+  Channel: Public (0x8b)
+  Time:    14:32:05 UTC
+  Message: Alice: Hello mesh!
+```
+
+---
+
+### Injecting Messages for Debugging
+
+`bridge_inject.py` builds a properly encrypted `GRP_TXT` mesh packet and injects it into a repeater. This is useful for verifying that the bridge is relaying traffic, testing decryption, or simulating mesh traffic without a physical LoRa device.
+
+**Inject via UDP directly to a local repeater** (or to `bridge_relay.py` in relay mode):
+
+```bash
+# Send to the local broadcast address — reaches any EthernetBridge on the LAN
+python3 tools/bridge_inject.py \
+  --sender "TestNode" \
+  --message "Hello from inject!" \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --host 255.255.255.255 \
+  --port 5005
+
+# Send to a specific repeater by IP
+python3 tools/bridge_inject.py \
+  --sender "TestNode" \
+  --message "Ping!" \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --host 192.168.1.42 \
+  --port 5005
+```
+
+**Inject via the MQTT queue** (message is forwarded by `bridge_relay.py` to all sites):
+
+```bash
+python3 tools/bridge_inject.py \
+  --sender "TestNode" \
+  --message "Hello from MQTT inject!" \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --mqtt-transport \
+  --mqtt-host broker.hivemq.com \
+  --network-id mynetwork \
+  --site-id injector
+```
+
+**Dry-run** — build the packet and print the raw hex without sending anything:
+
+```bash
+python3 tools/bridge_inject.py \
+  --sender "TestNode" \
+  --message "Test" \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --dry-run
+```
+
+**Tip:** Run `bridge_monitor.py` in a separate terminal while injecting to confirm the packet reaches the bridge and is decoded correctly:
+
+```bash
+# Terminal 1 — watch for incoming packets
+python3 tools/bridge_monitor.py \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72"
+
+# Terminal 2 — inject a test message
+python3 tools/bridge_inject.py \
+  --sender "Debug" --message "Can you see this?" \
+  --channel "Public:8b3387e9c5cdea6ac9e5edbaa115cd72" \
+  --host 255.255.255.255
+```
+
+---
+
 ## 🛠 Hardware Compatibility
 
 MeshCore is designed for devices listed in the [MeshCore Flasher](https://flasher.meshcore.co.uk)
